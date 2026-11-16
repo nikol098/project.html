@@ -1,0 +1,317 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Light show coordinator</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  body { font-family: system-ui, sans-serif; max-width: 42rem; margin: 2rem auto; padding: 0 1rem; line-height: 1.5; }
+  section { margin: 1.5rem 0; }
+  #qr { margin: 1rem 0; width: 256px; background: #fff; padding: 16px; }
+  video { width: 100%; max-height: 40vh; background: #000; margin-top: 0.75rem; }
+  #count { font-size: 1.5rem; }
+  a { word-break: break-all; }
+</style>
+</head>
+<body>
+<h1>Light show coordinator</h1>
+
+<section>
+  <p id="status">Starting…</p>
+  <div id="qr"></div>
+  <p>Room code: <strong id="room" style="font-size:1.5rem"></strong></p>
+  <label>Phone page address (only needed if this page is not on GitHub Pages)
+    <input id="baseUrl" placeholder="https://yourname.github.io/yourrepo/index.html" style="width:100%"></label>
+  <a id="link" target="_blank" rel="noopener"></a>
+</section>
+
+<section>
+  <label>Media file <input type="file" id="file" accept="audio/*,video/*"></label>
+  <video id="media" controls playsinline></video>
+</section>
+
+<section>
+  <h2>Beats</h2>
+  <p id="beatInfo">Choose a media file and the beats are detected automatically.</p>
+  <label><input type="checkbox" id="useBeats" checked> Light on the beats (otherwise on the vibration cues)</label>
+  <p>
+    <label>Flash on
+      <select id="every">
+        <option value="1">every beat</option>
+        <option value="2">every 2nd beat</option>
+        <option value="3">every 3rd beat</option>
+        <option value="4" selected>every 4th beat</option>
+        <option value="8">every 8th beat</option>
+      </select>
+    </label>
+    <label>starting at beat # <input type="number" id="startBeat" min="1" value="1" style="width:4.5rem"></label>
+  </p>
+  <p>
+    <label>BPM <input type="number" id="bpm" step="0.1" style="width:5.5rem"></label>
+    <label>First beat (s) <input type="number" id="first" step="0.001" value="0" style="width:6rem"></label>
+    <button id="grid">Use manual grid</button>
+  </p>
+  <div style="background:#000;width:3rem;height:3rem" title="Beat preview"><div id="pulse" style="width:100%;height:100%;background:rgb(0,255,0);opacity:0"></div></div>
+</section>
+
+<section>
+  <h2>Money gun</h2>
+  <p>Put it where nobody sings. The lights pause while it plays and continue when it ends, so set the end where the singing starts again. Play the song and press the buttons at the right moments.</p>
+  <label>Starts at (s) <input type="number" id="moneyAt" step="0.01" style="width:6rem"></label>
+  <button id="setAt">Set to now</button>
+  <label>Ends at (s) <input type="number" id="moneyEnd" step="0.01" style="width:6rem"></label>
+  <button id="setEnd">Set to now</button>
+</section>
+
+<section>
+  <p>Phones connected: <strong id="count">0</strong></p>
+  <label>Light delay (ms) <input type="number" id="trim" value="0" step="10" style="width:6rem"></label>
+  <button id="test">Test flash</button>
+  <button id="testMoney">Test money</button>
+  <p><small>Raise the delay if the sound reaches the room later than the lights (for example, Bluetooth speakers).</small></p>
+</section>
+
+<script>
+/* ===== Edit the show here; phones receive this when they connect ===== */
+const CONFIG = {
+  cues: [               // [vibration start, vibration end] in seconds of media time
+    [10.255, 12.385],
+    [12.980, 14.935],
+    [15.562, 17.519],
+    [18.145, 19.220],
+    [19.433, 19.970],
+    [20.715, 22.699],
+    [23.304, 25.260],
+    [25.885, 27.840],
+    [28.466, 29.745]
+  ],
+  money: { at: 30, end: 38 },   // money-gun start and end (s); set them on the page while the song plays
+  whiteFlicker: [{ from: 177, to: 198, every: 2, brightness: 0.15 }],   // 2:57 to 3:18: dim white on every 2nd beat
+  light: {
+    colors: [[0, 255, 0], [255, 170, 200]], // flashes alternate: green, light pink
+    holdMs: 50,         // full brightness
+    fadeMs: 1950,       // then fade to black
+    gamma: 1,           // 1 = linear fade; above 1 drops faster at first and lingers dim
+    fitFadeToBeat: true, // shorten the fade when the next flash comes sooner than fadeMs
+    brightness: 0.75     // 1 = full brightness; lower is gentler
+  }
+};
+/* ===================================================================== */
+
+const $ = id => document.getElementById(id);
+const media = $('media');
+const conns = new Set();
+let trimMs = 0;
+
+/* ---------- PeerJS room ---------- */
+const alphabet = 'abcdefghjkmnpqrstuvwxyz23456789';
+const randomRoom = () => 'ls-' + Array.from({ length: 5 }, () => alphabet[Math.floor(Math.random() * alphabet.length)]).join('');
+
+let roomId = '';
+function renderLink() {
+  if (!roomId) return;
+  const typed = $('baseUrl').value.trim();
+  const base = typed || new URL('index.html', location.href).href;
+  const url = base + (base.includes('?') ? '&' : '?') + 'room=' + roomId;
+  const local = location.protocol === 'file:' || /^(localhost|127\.|\[::1\])/.test(location.hostname);
+  $('status').textContent = local && !typed
+    ? 'This page is not on the internet, so phones cannot open this link. Type the public address of index.html below (your GitHub Pages address).'
+    : 'Ready. Phones scan the QR code, or open the link and type the room code.';
+  $('link').href = url; $('link').textContent = url;
+  $('room').textContent = roomId;
+  $('qr').innerHTML = '';
+  if (window.QRCode) new QRCode($('qr'), { text: url, width: 256, height: 256, correctLevel: QRCode.CorrectLevel.L });
+  else $('qr').textContent = 'The QR library did not load. Use the link or the room code.';
+}
+$('baseUrl').value = localStorage.getItem('baseUrl') || '';
+$('baseUrl').onchange = () => { localStorage.setItem('baseUrl', $('baseUrl').value.trim()); renderLink(); };
+
+function start(room) {
+  const peer = new Peer(room);
+  peer.on('open', id => {
+    localStorage.setItem('room', id);
+    roomId = id;
+    renderLink();
+  });
+  peer.on('connection', onConnection);
+  peer.on('disconnected', () => peer.reconnect());
+  peer.on('error', e => {
+    if (e.type === 'unavailable-id') start(randomRoom());
+    else $('status').textContent = 'Connection problem: ' + e.type;
+  });
+}
+start(localStorage.getItem('room') || randomRoom());
+
+function onConnection(conn) {
+  conn.on('open', () => {
+    conns.add(conn); updateCount();
+    conn.send(configMsg());
+    conn.send(stateMsg());
+  });
+  conn.on('data', d => {
+    if (d.type === 'ping') conn.send({ type: 'pong', t0: d.t0, tc: performance.now() });
+  });
+  const drop = () => { conns.delete(conn); updateCount(); };
+  conn.on('close', drop);
+  conn.on('error', drop);
+}
+const updateCount = () => { $('count').textContent = conns.size; };
+const broadcast = msg => conns.forEach(c => c.open && c.send(msg));
+
+/* ---------- playback state ---------- */
+const stateMsg = () => ({
+  type: 'state',
+  playing: !media.paused && !media.ended,
+  mediaTime: media.currentTime,
+  coordNow: performance.now(),   // sampled at the same moment as mediaTime
+  rate: media.playbackRate,
+  trimMs
+});
+['playing', 'pause', 'seeked', 'ratechange', 'ended'].forEach(ev =>
+  media.addEventListener(ev, () => broadcast(stateMsg())));
+setInterval(() => { if (!media.paused) broadcast(stateMsg()); }, 1000);   // drift correction
+
+$('file').onchange = e => {
+  const f = e.target.files[0];
+  if (!f) return;
+  media.src = URL.createObjectURL(f);
+  media.load();
+  detectBeats(f).catch(err => { $('beatInfo').textContent = 'Beat detection failed: ' + err.message; });
+};
+$('trim').onchange = e => { trimMs = Number(e.target.value) || 0; broadcast(stateMsg()); };
+$('test').onclick = () => broadcast({ type: 'test' });
+
+/* ---------- beats ---------- */
+let beats = [];
+const round3 = t => Math.round(t * 1000) / 1000;
+// Flash only on every Nth beat (gentler on the eyes). Inside a whiteFlicker window a dim white flash
+// goes on every `every`-th beat instead, and never more than about 3 per second.
+const MIN_GAP = 0.35;
+let flashList = { times: [], rgb: [], br: [] };
+function rebuild() {
+  const L = CONFIG.light, beatMode = $('useBeats').checked && beats.length > 0;
+  let normal;
+  if (beatMode) {
+    const every = Number($('every').value) || 1, start = Math.max(0, (Number($('startBeat').value) || 1) - 1);
+    normal = beats.filter((_, i) => i >= start && (i - start) % every === 0);
+  } else normal = CONFIG.cues.map(c => c[0]);
+  const wins = beatMode ? CONFIG.whiteFlicker : [];
+  const items = [];
+  let k = 0;
+  for (const t of normal) if (!wins.some(w => t >= w.from && t < w.to)) items.push({ t, rgb: L.colors[k++ % L.colors.length], br: L.brightness });
+  for (const w of wins) {
+    let last = -1, n = 0;
+    for (const t of beats) {
+      if (t < w.from || t >= w.to) continue;
+      if (n++ % (w.every || 1) === 0 && t - last >= MIN_GAP) { items.push({ t, rgb: [255, 255, 255], br: w.brightness }); last = t; }
+    }
+  }
+  items.sort((x, y) => x.t - y.t);
+  flashList = { times: items.map(i => round3(i.t)), rgb: items.map(i => i.rgb), br: items.map(i => i.br) };
+}
+const moneyEvents = () => {
+  const at = parseFloat($('moneyAt').value), end = parseFloat($('moneyEnd').value);
+  return at >= 0 && end > at ? [{ at, duration: end - at }] : [];
+};
+const configMsg = () => ({ type: 'config', cues: CONFIG.cues, light: CONFIG.light, money: moneyEvents(),
+  lightTimes: flashList.times, lightRgb: flashList.rgb, lightBr: flashList.br });
+const pushConfig = () => { rebuild(); broadcast(configMsg()); };
+rebuild();
+$('useBeats').onchange = $('every').onchange = $('startBeat').onchange = pushConfig;
+$('testMoney').onclick = () => broadcast({ type: 'testMoney' });
+$('moneyAt').value = CONFIG.money.at; $('moneyEnd').value = CONFIG.money.end;
+$('moneyAt').onchange = $('moneyEnd').onchange = pushConfig;
+$('setAt').onclick = () => { $('moneyAt').value = media.currentTime.toFixed(2); pushConfig(); };
+$('setEnd').onclick = () => { $('moneyEnd').value = media.currentTime.toFixed(2); pushConfig(); };
+
+function setBeats(list, label) {
+  beats = list.map(round3);
+  $('beatInfo').textContent = label;
+  pushConfig();
+}
+
+// Decode the file, keep the bass (kick drum), find the tempo and phase, then follow the beats.
+async function detectBeats(file) {
+  $('beatInfo').textContent = 'Analysing the song…';
+  const ac = new (window.AudioContext || window.webkitAudioContext)();
+  const buf = await ac.decodeAudioData(await file.arrayBuffer());
+  ac.close();
+
+  const off = new OfflineAudioContext(1, buf.length, buf.sampleRate);
+  const src = off.createBufferSource(); src.buffer = buf;
+  const lp = off.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 150;
+  src.connect(lp); lp.connect(off.destination); src.start();
+  const data = (await off.startRendering()).getChannelData(0);
+
+  const hop = Math.round(buf.sampleRate * 0.01), dt = hop / buf.sampleRate;   // 10 ms frames
+  const n = Math.floor(data.length / hop);
+  const env = new Float32Array(n), flux = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    let s = 0;
+    for (let j = i * hop; j < (i + 1) * hop; j++) s += data[j] * data[j];
+    env[i] = Math.log(1 + 1000 * Math.sqrt(s / hop));
+  }
+  for (let i = 1; i < n; i++) flux[i] = Math.max(0, env[i] - env[i - 1]);
+  const sm = new Float32Array(n);
+  for (let i = 0; i < n; i++) sm[i] = flux[i] + 0.5 * (flux[i - 1] || 0) + 0.5 * (flux[i + 1] || 0);
+  const mean = sm.reduce((a, b) => a + b, 0) / n;
+
+  // Best tempo + phase: average onset strength on a regular grid, with a mild preference near 120 BPM.
+  let best = { score: -1, bpm: 120, ph: 0 };
+  for (let bpm = 70; bpm <= 180; bpm += 0.1) {
+    const period = 60 / bpm / dt;
+    const prior = Math.exp(-0.5 * Math.pow(Math.log2(bpm / 120) / 0.5, 2));
+    for (let ph = 0; ph < period; ph += 1) {
+      let s = 0, c = 0;
+      for (let t = ph; t < n - 1; t += period) { s += sm[Math.round(t)]; c++; }
+      const score = (s / c) * prior;
+      if (score > best.score) best = { score, bpm, ph: ph * dt };
+    }
+  }
+
+  // Walk the grid, snapping each beat to the strongest bass onset within ±40 ms and nudging the grid along.
+  const period = 60 / best.bpm, out = [];
+  for (let t = best.ph; t < buf.duration; ) {
+    const c = Math.round(t / dt);
+    let bi = -1, bv = mean;
+    for (let k = Math.max(1, c - 4); k <= Math.min(n - 2, c + 4); k++) if (sm[k] > bv) { bv = sm[k]; bi = k; }
+    if (bi >= 0) { const b = bi * dt; out.push(b); t += period + 0.3 * (b - t); }
+    else { out.push(t); t += period; }
+  }
+  $('bpm').value = best.bpm.toFixed(1);
+  $('first').value = best.ph.toFixed(3);
+  setBeats(out, `Detected about ${best.bpm.toFixed(1)} BPM, ${out.length} beats. Check the preview square while the song plays.`);
+}
+
+$('grid').onclick = () => {
+  const bpm = Number($('bpm').value), first = Number($('first').value) || 0;
+  if (!(bpm > 0)) return;
+  const end = isFinite(media.duration) ? media.duration : 600, out = [];
+  for (let t = first; t < end; t += 60 / bpm) out.push(t);
+  setBeats(out, `Manual grid: ${bpm} BPM, ${out.length} beats.`);
+};
+
+// Preview square: same hold/fade as on the phones, without the light delay.
+(function loop() {
+  const t = media.currentTime, times = flashList.times, L = CONFIG.light;
+  let lo = 0, hi = times.length - 1, i = -1, level = 0;
+  while (lo <= hi) { const m = (lo + hi) >> 1; if (times[m] <= t) { i = m; lo = m + 1; } else hi = m - 1; }
+  if (i >= 0) {
+    $('pulse').style.background = `rgb(${flashList.rgb[i].join(',')})`;
+    const a = (t - times[i]) * 1000, gap = times[i + 1] - times[i];
+    let fade = L.fadeMs;
+    if (L.fitFadeToBeat && gap > 0) fade = Math.min(fade, Math.max(120, gap * 850 - L.holdMs));
+    level = a < L.holdMs ? 1 : Math.max(0, 1 - (a - L.holdMs) / fade);
+    level = Math.pow(level, L.gamma);
+  }
+  const mw = moneyEvents()[0];                       // the lights rest during the money gun
+  if (mw && t >= mw.at && t < mw.at + mw.duration) level = 0;
+  $('pulse').style.opacity = level * (i >= 0 ? flashList.br[i] : 0);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>

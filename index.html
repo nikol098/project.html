@@ -1,0 +1,335 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Light show</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<style>
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden;
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    font-family: system-ui, sans-serif; }
+  #light { position: fixed; inset: 0; background: rgb(0, 255, 0); opacity: 0; will-change: opacity; }
+  #money { position: fixed; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+  #gate { position: fixed; inset: 0; z-index: 2; background: #000; color: #ddd;
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1.5rem; padding: 2rem; text-align: center; }
+  #gate button { font: inherit; font-size: 1.3rem; padding: 1rem 2rem; border-radius: 0.75rem;
+    border: 0; background: #1fd655; color: #000; }
+  #manual { display: flex; gap: .5rem; }
+  #manual input { font: inherit; font-size: 1.2rem; padding: .6rem; border-radius: .5rem; border: 0; width: 11rem; text-align: center; }
+  #hint { position: fixed; left: 0; right: 0; bottom: env(safe-area-inset-bottom, 0px);
+    padding: 0.75rem; text-align: center; color: #666; font-size: 0.9rem; z-index: 1; }
+</style>
+</head>
+<body>
+<div id="light"></div>
+<canvas id="money"></canvas>
+<div id="gate">
+  <p id="msg">Connecting…</p>
+  <div id="manual" hidden>
+    <input id="code" placeholder="Room code" autocapitalize="off" autocomplete="off" autocorrect="off">
+    <button id="join">Join</button>
+  </div>
+  <button id="go" hidden>Join in full screen</button>
+</div>
+<div id="hint"></div>
+
+<script>
+let room = new URLSearchParams(location.search).get('room') || '';
+const $ = id => document.getElementById(id);
+const lightEl = $('light');
+
+// Replaced by the coordinator's config as soon as the connection opens.
+let cues = [], cueStarts = [], lightTimes = [];   // vibration cues vs. light flash times
+let light = { colors: [[0, 255, 0], [255, 170, 200]], holdMs: 50, fadeMs: 1950, gamma: 1, fitFadeToBeat: true, brightness: 0.75 };
+let shownIdx = -1;   // index of the flash whose colour is currently applied
+let money = [], testMoneyUntil = 0;
+let lightRgb = null, lightBr = null, curBr = 0.75;   // per-flash colour and brightness from the coordinator
+let diag = '', slowTimer;
+
+let peer, conn, retryTimer;
+let connected = false, armed = false;
+let state = null;                 // last playback state from the coordinator
+let offset = 0, synced = false;   // coordinatorClock = performance.now() + offset
+const samples = [];
+let prevMt = null, lastFired = -1, testStart = -Infinity;
+let wakeLock = null;
+
+/* ---------- UI ---------- */
+function refreshGate() {
+  const fsSupported = !!document.documentElement.requestFullscreen;
+  const needGate = !armed || (fsSupported && !document.fullscreenElement);
+  $('gate').hidden = !needGate;
+  $('go').hidden = !connected;
+  $('msg').textContent = !connected ? (!room ? 'Type the room code shown on the coordinator.' : diag || 'Connecting…')
+    : armed ? 'Tap to return to full screen'
+    : 'Connected. Tap to join the show.';
+  $('hint').textContent = !armed ? ''
+    : !connected ? 'Reconnecting…'
+    : !(state && state.playing) ? 'Waiting for the show to start' : '';
+}
+
+$('go').onclick = async () => {
+  armed = true;
+  if (navigator.vibrate) navigator.vibrate(40);   // user gesture unlocks vibration
+  try { await document.documentElement.requestFullscreen({ navigationUI: 'hide' }); } catch (e) {}
+  requestWakeLock();
+  refreshGate();
+};
+document.addEventListener('fullscreenchange', refreshGate);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) requestWakeLock(); });
+
+async function requestWakeLock() {
+  try { if (armed && navigator.wakeLock) wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {}
+}
+
+/* ---------- connection ---------- */
+$('join').onclick = () => {
+  let v = $('code').value.trim();
+  try { v = new URL(v).searchParams.get('room') || v; } catch (e) {}   // a pasted link works too
+  room = v.toLowerCase();
+  if (room) connect();
+};
+function connect() {
+  clearTimeout(retryTimer);
+  if (!room) { $('msg').textContent = 'Type the room code shown on the coordinator.'; $('manual').hidden = false; return; }
+  $('manual').hidden = true;
+  try { peer && peer.destroy(); } catch (e) {}
+  peer = new Peer();
+  diag = ''; clearTimeout(slowTimer);
+  slowTimer = setTimeout(() => {
+    if (!connected) { diag = 'Still connecting… the phone and the computer should be on the same Wi-Fi.'; refreshGate(); }
+  }, 10000);
+  peer.on('open', () => {
+    conn = peer.connect(room, { reliable: true });
+    conn.on('open', onOpen);
+    conn.on('data', onData);
+    conn.on('close', scheduleRetry);
+    conn.on('error', scheduleRetry);
+  });
+  peer.on('error', e => {
+    diag = e.type === 'peer-unavailable'
+      ? 'Coordinator not found. Keep the coordinator page open and check that the room code matches. Retrying…'
+      : 'Cannot reach the server (' + e.type + '). Retrying…';
+    scheduleRetry();
+  });
+}
+function scheduleRetry() {
+  connected = false; synced = false;
+  refreshGate();
+  clearTimeout(retryTimer);
+  retryTimer = setTimeout(connect, 2000);
+}
+function onOpen() {
+  connected = true; diag = '';
+  samples.length = 0;
+  for (let i = 0; i < 10; i++) setTimeout(sendPing, i * 150);   // quick initial clock sync
+  refreshGate();
+}
+setInterval(() => sendPing(), 3000);                             // keep refining it
+function sendPing() { if (conn && conn.open) conn.send({ type: 'ping', t0: performance.now() }); }
+
+function onData(d) {
+  if (d.type === 'config') {
+    cues = d.cues; light = d.light;
+    cueStarts = cues.map(c => c[0]);
+    lightTimes = d.lightTimes && d.lightTimes.length ? d.lightTimes : cueStarts;
+    money = d.money || [];
+    const own = d.lightTimes && d.lightTimes.length;
+    lightRgb = own ? d.lightRgb : null; lightBr = own ? d.lightBr : null;
+    shownIdx = -1;
+  } else if (d.type === 'state') {
+    state = d;
+    if (!d.playing && navigator.vibrate) navigator.vibrate(0);
+    refreshGate();
+  } else if (d.type === 'pong') {
+    const t1 = performance.now(), rtt = t1 - d.t0;
+    samples.push({ rtt, off: d.tc - (d.t0 + rtt / 2) });
+    if (samples.length > 12) samples.shift();
+    offset = samples.reduce((a, b) => (b.rtt < a.rtt ? b : a)).off;   // trust the lowest-latency sample
+    synced = true;
+  } else if (d.type === 'testMoney') {
+    testMoneyUntil = performance.now() + 4000;
+  } else if (d.type === 'test') {
+    testStart = performance.now();
+    vibrate(500);
+  }
+}
+
+/* ---------- timing, light, vibration ---------- */
+function mediaNow() {
+  if (!state || !synced) return null;
+  let t = state.mediaTime;
+  if (state.playing) t += ((performance.now() + offset) - state.coordNow) / 1000 * state.rate;
+  return t - state.trimMs / 1000;
+}
+function vibrate(ms) { if (armed && navigator.vibrate && ms > 0) navigator.vibrate(ms); }
+
+// Sudden start, full brightness for holdMs, then fade to 0 over fadeMs.
+// With fitFadeToBeat the fade ends shortly before the next flash, so fast beats still pulse.
+function lightLevel(ageSec, gapSec) {
+  const a = ageSec * 1000;
+  if (a < 0) return 0;
+  if (a < light.holdMs) return 1;
+  let fade = light.fadeMs;
+  if (light.fitFadeToBeat && gapSec > 0) fade = Math.min(fade, Math.max(120, gapSec * 850 - light.holdMs));
+  const x = (a - light.holdMs) / fade;
+  return x >= 1 ? 0 : Math.pow(1 - x, light.gamma);
+}
+function latestBefore(times, mt) {   // binary search: index of the last time <= mt
+  let lo = 0, hi = times.length - 1, idx = -1;
+  while (lo <= hi) {
+    const m = (lo + hi) >> 1;
+    if (times[m] <= mt) { idx = m; lo = m + 1; } else hi = m - 1;
+  }
+  return idx;
+}
+
+function frame() {
+  const mt = mediaNow();
+  let level = 0;
+  if (mt !== null) {
+    // The latest cue always wins, so overlapping cues restart the flash automatically.
+    const li = latestBefore(lightTimes, mt);
+    if (li >= 0) {
+      level = lightLevel(mt - lightTimes[li], lightTimes[li + 1] - lightTimes[li]);
+      if (li !== shownIdx) {   // each flash has its own colour and brightness
+        const rgb = lightRgb ? lightRgb[li] : light.colors[li % light.colors.length];
+        lightEl.style.background = `rgb(${rgb.join(',')})`;
+        curBr = lightBr ? lightBr[li] : light.brightness;
+        shownIdx = li;
+      }
+    }
+    const idx = latestBefore(cueStarts, mt);
+
+    if (prevMt === null) {
+      lastFired = idx;                               // joined mid-show: don't fire old cues
+    } else {
+      const d = mt - prevMt;
+      if (d < -0.1 || d >= 0.5) {                    // seek or long hiccup
+        lastFired = idx;
+        if (navigator.vibrate) navigator.vibrate(0);
+      } else if (state.playing) {
+        for (let i = lastFired + 1; i <= idx; i++) { // cues crossed since last frame
+          vibrate(Math.round((cues[i][1] - cues[i][0]) * 1000 - (mt - cues[i][0]) * 1000));
+          lastFired = i;
+        }
+      }
+    }
+  }
+  prevMt = mt;
+  const inMoney = mt !== null && state.playing && money.some(e => mt >= e.at && mt < e.at + e.duration);
+  if (inMoney) level = 0;   // the lights rest while the money gun plays, then continue
+  drawMoney(inMoney || performance.now() < testMoneyUntil);
+  lightEl.style.opacity = Math.max(level * curBr, lightLevel((performance.now() - testStart) / 1000) * light.brightness);
+  requestAnimationFrame(frame);
+}
+
+/* ---------- money gun ---------- */
+const canvas = $('money'), ctx = canvas.getContext('2d');
+let cw = 0, ch = 0, bills = [], lastDraw = performance.now(), spawnAcc = 0, dirty = false, gunAlpha = 0;
+const GUN_FADE = 0.8;    // seconds for the gun to fade in and out
+const GUN_ANGLE = -1.25;   // radians: the barrel points up and slightly to the right
+
+function resizeCanvas() {
+  const r = window.devicePixelRatio || 1;
+  cw = window.innerWidth; ch = window.innerHeight;
+  canvas.width = cw * r; canvas.height = ch * r;
+  ctx.setTransform(r, 0, 0, r, 0, 0);
+}
+window.addEventListener('resize', resizeCanvas);
+resizeCanvas();
+
+function rr(x, y, w, h, r) {
+  ctx.beginPath();
+  if (ctx.roundRect) ctx.roundRect(x, y, w, h, r); else ctx.rect(x, y, w, h);
+}
+
+// Side-view toy money gun with an orange tip and bills in a clear hopper. Drawn pointing right, then rotated.
+function drawGun(x, y, s, recoil) {
+  ctx.save();
+  ctx.translate(x, y); ctx.rotate(GUN_ANGLE); ctx.translate(-recoil, 0);
+  ctx.fillStyle = '#1c1f24';                                   // grip
+  ctx.beginPath();
+  ctx.moveTo(-.5 * s, .05 * s); ctx.lineTo(-.1 * s, .05 * s);
+  ctx.lineTo(-.22 * s, .68 * s); ctx.lineTo(-.58 * s, .68 * s);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = '#2b2f36'; ctx.lineWidth = s * .04;        // trigger guard and trigger
+  ctx.beginPath(); ctx.arc(.06 * s, .13 * s, .13 * s, 0, Math.PI); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(.04 * s, .06 * s); ctx.lineTo(.02 * s, .17 * s); ctx.stroke();
+  const g = ctx.createLinearGradient(0, -.25 * s, 0, .09 * s);  // body
+  g.addColorStop(0, '#5a6270'); g.addColorStop(.5, '#2f343c'); g.addColorStop(1, '#1d2025');
+  ctx.fillStyle = g; rr(-.55 * s, -.25 * s, 1.25 * s, .34 * s, .05 * s); ctx.fill();
+  ctx.fillStyle = 'rgba(255,255,255,.18)'; ctx.fillRect(-.5 * s, -.22 * s, 1.15 * s, .03 * s);
+  ctx.fillStyle = '#ff7a00'; rr(.7 * s, -.23 * s, .12 * s, .3 * s, .02 * s); ctx.fill();   // orange toy tip
+  ctx.fillStyle = 'rgba(170,215,255,.55)'; rr(-.25 * s, -.5 * s, .7 * s, .27 * s, .04 * s); ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,.7)'; ctx.lineWidth = s * .015; ctx.stroke();           // hopper
+  ctx.fillStyle = '#85bb65';
+  for (let i = 0; i < 4; i++) ctx.fillRect(-.2 * s + i * .15 * s, -.46 * s, .11 * s, .19 * s); // bills inside
+  ctx.restore();
+}
+
+// A banknote that tumbles: its height shrinks and flips as it turns edge-on.
+function drawBill(b) {
+  const w = b.sz * 2.2, h = b.sz, f = Math.cos(b.f);
+  ctx.save();
+  ctx.translate(b.x, b.y); ctx.rotate(b.r); ctx.scale(1, f);
+  ctx.globalAlpha = 0.8 + 0.2 * Math.abs(f);
+  ctx.fillStyle = f > 0 ? '#8cc26b' : '#74a857';
+  ctx.fillRect(-w / 2, -h / 2, w, h);
+  ctx.strokeStyle = '#3d6b34'; ctx.lineWidth = 1.5;
+  ctx.strokeRect(-w / 2 + 3, -h / 2 + 3, w - 6, h - 6);
+  ctx.beginPath(); ctx.arc(0, 0, h * .3, 0, Math.PI * 2);
+  ctx.fillStyle = '#b5d99c'; ctx.fill(); ctx.stroke();
+  ctx.fillStyle = '#3d6b34'; ctx.font = `bold ${h * .42}px serif`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillText('$', 0, 1);
+  ctx.restore();
+}
+
+function drawMoney(active) {
+  const now = performance.now(), dt = Math.min(0.05, (now - lastDraw) / 1000);
+  lastDraw = now;
+  gunAlpha = Math.max(0, Math.min(1, gunAlpha + (active ? dt : -dt) / GUN_FADE));
+  if (!active && !bills.length && gunAlpha === 0) {                      // nothing to show: clear once and stay idle
+    if (dirty) { ctx.clearRect(0, 0, cw, ch); dirty = false; }
+    return;
+  }
+  dirty = true;
+  const s = Math.min(cw, ch) * 0.3, gx = cw * 0.42, gy = ch - s * 0.6 + (1 - gunAlpha) * s * 0.5;   // slides up while fading in
+  const mx = gx + Math.cos(GUN_ANGLE) * .82 * s + Math.sin(GUN_ANGLE) * .08 * s;   // muzzle position
+  const my = gy + Math.sin(GUN_ANGLE) * .82 * s - Math.cos(GUN_ANGLE) * .08 * s;
+  if (active && gunAlpha > 0.5) {                      // a fast stream of bills out of the muzzle
+    spawnAcc += dt * 28;
+    while (spawnAcc >= 1) {
+      spawnAcc--;
+      const dir = GUN_ANGLE + (Math.random() - 0.5) * 0.5, sp = ch * (1.0 + Math.random() * 0.7);
+      bills.push({ x: mx, y: my, vx: Math.cos(dir) * sp + (Math.random() - 0.5) * cw * 0.6, vy: Math.sin(dir) * sp,
+        r: Math.random() * 6.28, vr: (Math.random() - 0.5) * 3, f: Math.random() * 6.28, vf: 4 + Math.random() * 8,
+        sz: 14 + Math.random() * 10, ph: Math.random() * 6.28 });
+    }
+  }
+  ctx.clearRect(0, 0, cw, ch);
+  for (const b of bills) {
+    b.vy = Math.min(b.vy + ch * 1.2 * dt, ch * 0.35);            // gravity with a slow, fluttering fall
+    b.vx *= 1 - 0.6 * dt;
+    b.x += b.vx * dt + Math.sin(now / 300 + b.ph) * 20 * dt;
+    b.y += b.vy * dt; b.r += b.vr * dt; b.f += b.vf * dt;
+    drawBill(b);
+  }
+  bills = bills.filter(b => b.y < ch + 60);
+  if (gunAlpha > 0) {
+    ctx.save(); ctx.globalAlpha = gunAlpha;
+    drawGun(gx, gy, s, active ? Math.abs(Math.sin(now / 45)) * s * 0.02 : 0);
+    ctx.restore();
+  }
+}
+
+refreshGate();
+connect();
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
